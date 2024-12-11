@@ -8,12 +8,13 @@ import os
 import platform
 import re
 import sys
+import threading
 import time
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Protocol, overload
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Protocol, overload, Any, List, Dict, Optional
 
 import requests
 from requests.exceptions import ChunkedEncodingError
@@ -176,7 +177,7 @@ class GPT4All:
         device: str | None = None,
         n_ctx: int = 2048,
         ngl: int = 100,
-        verbose: bool = False,
+        verbose: bool = False
     ):
         """
         Constructor
@@ -203,11 +204,14 @@ class GPT4All:
             ngl: Number of GPU layers to use (Vulkan)
             verbose: If True, print debug messages.
         """
-
+        
         self.model_type = model_type
         self._history: list[MessageType] | None = None
         self._current_prompt_template: str = "{0}"
-
+        self.sessions: Dict[str, List[Dict[str, str]]] = {}
+        self.current_session_id: Optional[str] = None
+        self.current_prompt_template: str = "{0}"
+        self.lock = threading.Lock()
         device_init = None
         if sys.platform == "darwin":
             if device is None:
@@ -265,7 +269,10 @@ class GPT4All:
 
     @property
     def current_chat_session(self) -> list[MessageType] | None:
-        return None if self._history is None else list(self._history)
+        with self.lock:
+            if self.current_session_id is None:
+                return None
+        return list(self.sessions.get(self.current_session_id, []))
 
     @staticmethod
     def list_models() -> list[ConfigType]:
@@ -496,7 +503,7 @@ class GPT4All:
         n_batch: int = 8,
         n_predict: int | None = None,
         streaming: bool = False,
-        callback: ResponseCallbackType = empty_response_callback,
+        callback: Any = None,  # 根据原代码，类型为 ResponseCallbackType
     ) -> Any:
         """
         Generate outputs from any GPT4All model.
@@ -518,9 +525,57 @@ class GPT4All:
         Returns:
             Either the entire completion or a generator that yields the completion token by token.
         """
+        with self.lock:
+            if self.current_session_id is None:
+                raise ValueError("No active chat session. Use `chat_session` context manager to start a session.")
+            
+            
+            session_history = self.sessions[self.current_session_id]
+            
+            
+            session_history.append({"role": "user", "content": prompt})
+            output_collector = session_history
 
-        # Preparing the model request
-        generate_kwargs: dict[str, Any] = dict(
+        
+        def _callback_wrapper(
+            callback: Any,
+            output_collector: List[Dict[str, str]],
+        ) -> Any:
+            def _callback(token_id: int, response: str) -> bool:
+                nonlocal callback, output_collector
+
+                output_collector[-1]["content"] += response
+
+                if callback:
+                    return callback(token_id, response)
+                return True  
+
+            return _callback
+
+        
+        wrapped_callback = _callback_wrapper(callback, output_collector)
+
+        
+        if streaming:
+            return self.model.prompt_model_streaming(
+                prompt,
+                self.current_prompt_template,
+                wrapped_callback,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                repeat_penalty=repeat_penalty,
+                repeat_last_n=repeat_last_n,
+                n_batch=n_batch,
+                n_predict=n_predict,
+            )
+
+        
+        self.model.prompt_model(
+            prompt,
+            self.current_prompt_template,
+            wrapped_callback,
             temp=temp,
             top_k=top_k,
             top_p=top_p,
@@ -528,83 +583,21 @@ class GPT4All:
             repeat_penalty=repeat_penalty,
             repeat_last_n=repeat_last_n,
             n_batch=n_batch,
-            n_predict=n_predict if n_predict is not None else max_tokens,
+            n_predict=n_predict,
         )
 
-        if self._history is not None:
-            # check if there is only one message, i.e. system prompt:
-            reset = len(self._history) == 1
-            self._history.append({"role": "user", "content": prompt})
+        with self.lock:
+            
+            response = output_collector[-1]["content"]
+            
+            session_history.append({"role": "assistant", "content": response})
 
-            fct_func = self._format_chat_prompt_template.__func__  # type: ignore[attr-defined]
-            if fct_func is GPT4All._format_chat_prompt_template:
-                if reset:
-                    # ingest system prompt
-                    # use "%1%2" and not "%1" to avoid implicit whitespace
-                    self.model.prompt_model(self._history[0]["content"], "%1%2",
-                                            empty_response_callback,
-                                            n_batch=n_batch, n_predict=0, reset_context=True, special=True)
-                prompt_template = self._current_prompt_template.format("%1", "%2")
-            else:
-                warnings.warn(
-                    "_format_chat_prompt_template is deprecated. Please use a chat session with a prompt template.",
-                    DeprecationWarning,
-                )
-                # special tokens won't be processed
-                prompt = self._format_chat_prompt_template(
-                    self._history[-1:],
-                    self._history[0]["content"] if reset else "",
-                )
-                prompt_template = "%1"
-                generate_kwargs["reset_context"] = reset
-        else:
-            prompt_template = "%1"
-            generate_kwargs["reset_context"] = True
-
-        # Prepare the callback, process the model response
-        output_collector: list[MessageType]
-        output_collector = [
-            {"content": ""}
-        ]  # placeholder for the self._history if chat session is not activated
-
-        if self._history is not None:
-            self._history.append({"role": "assistant", "content": ""})
-            output_collector = self._history
-
-        def _callback_wrapper(
-            callback: ResponseCallbackType,
-            output_collector: list[MessageType],
-        ) -> ResponseCallbackType:
-            def _callback(token_id: int, response: str) -> bool:
-                nonlocal callback, output_collector
-
-                output_collector[-1]["content"] += response
-
-                return callback(token_id, response)
-
-            return _callback
-
-        # Send the request to the model
-        if streaming:
-            return self.model.prompt_model_streaming(
-                prompt,
-                prompt_template,
-                _callback_wrapper(callback, output_collector),
-                **generate_kwargs,
-            )
-
-        self.model.prompt_model(
-            prompt,
-            prompt_template,
-            _callback_wrapper(callback, output_collector),
-            **generate_kwargs,
-        )
-
-        return output_collector[-1]["content"]
+        return response
 
     @contextmanager
     def chat_session(
         self,
+        session_id: str,
         system_prompt: str | None = None,
         prompt_template: str | None = None,
     ):
@@ -612,13 +605,19 @@ class GPT4All:
         Context manager to hold an inference optimized chat session with a GPT4All model.
 
         Args:
+            session_id: Unique identifier for the chat session.
             system_prompt: An initial instruction for the model.
             prompt_template: Template for the prompts with {0} being replaced by the user message.
         """
-
-        if system_prompt is None:
-            system_prompt = self.config.get("systemPrompt", "")
-
+        with self.lock:
+            if session_id not in self.sessions:
+                if system_prompt is None:
+                    system_prompt = self.config.get("systemPrompt", "")
+                self.session[session_id] = [{"role":"system","content": system_prompt}]
+                self._current_prompt_template = prompt_template or self.config.get("promptTemplate",DEFAULT_PROMPT_TEMPLATE)
+            previous_session_id = self.current_session_id
+            self.current_session_id = session_id
+        
         if prompt_template is None:
             if (tmpl := self.config.get("promptTemplate")) is None:
                 warnings.warn("Use of a sideloaded model or allow_download=False without specifying a prompt template "
@@ -635,9 +634,34 @@ class GPT4All:
         try:
             yield self
         finally:
-            self._history = None
-            self._current_prompt_template = "{0}"
+            with self.lock:
+                self.current_session_id = previous_session_id
+                self._current_prompt_template = "{0}"
+    def create_session(self, session_id: str, system_prompt: str = "", prompt_template: str | None = None):
+        with self.lock:
+            if session_id in self.sessions:
+                raise ValueError(f"Session '{session_id}' already exists.")
+            self.sessions[session_id] = [{"role": "system", "content": system_prompt}]
+            self.current_prompt_template = prompt_template or self.config.get("promptTemplate", DEFAULT_PROMPT_TEMPLATE)
 
+    def switch_session(self, session_id: str):
+        with self.lock:
+            if session_id not in self.sessions:
+                raise ValueError(f"Session '{session_id}' does not exist.")
+            self.current_session_id = session_id
+
+    def get_session_history(self, session_id: str) -> List[Dict[str, str]]:
+        with self.lock:
+            if session_id not in self.sessions:
+                raise ValueError(f"Session '{session_id}' does not exist.")
+            return list(self.sessions[session_id])
+
+    def delete_session(self, session_id: str):
+        with self.lock:
+            if session_id in self.sessions:
+                del self.sessions[session_id]
+            if self.current_session_id == session_id:
+                self.current_session_id = None
     @staticmethod
     def list_gpus() -> list[str]:
         """
